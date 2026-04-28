@@ -3,77 +3,160 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class TopDownFusionBlock(nn.Module):
-    def __init__(self, channels_low, channels_high, channels_out):
+    def __init__(self, channels_low, channels_high_star):
         super(TopDownFusionBlock, self).__init__()
         
-        self.reduce_low = nn.Conv2d(channels_low, channels_out, kernel_size=1, bias=False)
+        # 1. Reducem adâncimea canalelor pentru C_low (Fig 2: 1x1 Conv) [cite: 146]
+        # channels_high_star reprezintă canalele hărții superioare deja procesate
+        self.reduce_low = nn.Sequential(
+            nn.Conv2d(channels_low, channels_high_star, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels_high_star) # Adăugat pentru consistență 
+        )
         
-        if channels_high != channels_out:
-             self.reduce_high = nn.Conv2d(channels_high, channels_out, kernel_size=1, bias=False)
-        else:
-             self.reduce_high = nn.Identity()
-        
+        # 2. Rafinarea după adunare (Fig 2: cascada de convoluții) 
         self.post_add = nn.Sequential(
-            nn.Conv2d(channels_out, channels_out, kernel_size=3, padding=1, groups=channels_out, bias=False), 
-            nn.BatchNorm2d(channels_out), 
-            nn.Conv2d(channels_out, channels_out, kernel_size=1, bias=False),
-            nn.BatchNorm2d(channels_out) 
+            # Depthwise 3x3 [cite: 150, 157]
+            nn.Conv2d(channels_high_star, channels_high_star, kernel_size=3, 
+                      padding=1, groups=channels_high_star, bias=False),
+            nn.BatchNorm2d(channels_high_star),
+            nn.ReLU(inplace=True),
+            
+            # Pointwise 1x1 [cite: 150, 156]
+            nn.Conv2d(channels_high_star, channels_high_star, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels_high_star),
+            nn.ReLU(inplace=True)
         )
 
-    def forward(self, c_low, c_high):
+    def forward(self, c_low, c_high_star):
+        # A. Upsampling (2x) pentru harta superioară (Chigh*) [cite: 145, 162]
+        up_high = F.interpolate(c_high_star, size=(c_low.size(2), c_low.size(3)), mode='nearest')
         
-        c_high_up = F.interpolate(c_high, size=(c_low.size(2), c_low.size(3)), mode='nearest')
-        c_high_matched = self.reduce_high(c_high_up)
+        # B. Procesare C_low [cite: 146]
+        low_feat = self.reduce_low(c_low)
         
-        c_low_reduced = self.reduce_low(c_low)
+        # C. Element-wise addition [cite: 147, 161]
+        merged = low_feat + up_high
         
-        merged = c_low_reduced + c_high_matched
-        
+        # D. Generarea noii hărți C_low* [cite: 147, 159]
         return self.post_add(merged)
+
+class ConvBlock(nn.Module):
+    
+    def __init__(self, in_channels, out_channels, stride=1, padding=1):
+        super(ConvBlock, self).__init__()
+        
+        self.convBlock = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 3, stride=stride, padding=padding, groups=in_channels, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, out_channels, 1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+    def forward(self, x):
+        return self.convBlock(x)
+        
+        
+
 
 class ModifiedMobileNet(nn.Module):
     def __init__(self):
         super(ModifiedMobileNet, self).__init__()
         
-        self.features_to_conv5 = nn.Sequential(
-            nn.Conv2d(3, 128, kernel_size=3, stride=4, padding=1) 
+        # Input: 300x300x3
+        # Output: 150x150x32
+        
+        self.img_6 = nn.Sequential(
+            # conv 1
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+   
+                
+            # Input: 150x150x32 -> Output: 150x150x64 conv2 
+            ConvBlock(32, 64, stride=1),
+            
+            # Input: 150x150x64 -> Output: 75x75x128 conv3
+            ConvBlock(64, 128, stride=2),
+            
+            # Input: 75x75x128 -> Output: 75x75x128 conv 4
+            ConvBlock(128, 128, stride=1),
+            
+            # Input: 75x75x128 -> Output: 38x38x256 conv 5
+            ConvBlock(128, 256, stride=2),
+            
+            # Input: 38x38x256 -> Output: 38x38x512 (MĂRIME PĂSTRATĂ) conv 6
+            ConvBlock(256, 512, stride=1)
+        
         )
         
-        self.conv_6_to_8 = nn.Sequential(
-            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1), 
-            nn.ReLU(inplace=True)
+        # Input: 38x38x512 -> Output: 38x38x512 (MĂRIME PĂSTRATĂ) conv 7
+        self.conv7_8 = nn.Sequential(
+            ConvBlock(512, 512, stride=1),
+            ConvBlock(512, 512, stride=1)  # Output: 19x19x512
+        )
+            
+        self.conv9_11 = nn.Sequential(
+            # conv 9
+            ConvBlock(512, 512, stride=2),
+            # conv 10
+            ConvBlock(512, 512, stride=1),
+            # conv 11
+            ConvBlock(512, 512, stride=1)
         )
         
-        self.conv_9_to_11 = nn.Sequential(
-            nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True)
+        self.conv12_13 = nn.Sequential(
+            ConvBlock(512, 512, stride=2),
+            ConvBlock(512, 1024, stride=1),
         )
         
-        self.conv_12_to_13 = nn.Sequential(
-            nn.Conv2d(512, 1024, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True)
-        )
 
     def forward(self, x):
-        x = self.features_to_conv5(x)
-        c8 = self.conv_6_to_8(x)     
-        c11 = self.conv_9_to_11(c8)  
-        c13 = self.conv_12_to_13(c11)
+        x = self.img_6(x)
+        c8 = self.conv7_8(x)
+        c11 = self.conv9_11(c8)
+        c13 = self.conv12_13(c11)
+        
         return c8, c11, c13
+    
 
 class HandDetectionNetwork(nn.Module):
     def __init__(self, num_anchors=6):
         super(HandDetectionNetwork, self).__init__()
         self.backbone = ModifiedMobileNet()
         
-        self.extra_conv_14 = nn.Conv2d(1024, 512, kernel_size=3, stride=2, padding=1) 
-        self.extra_conv_15 = nn.Conv2d(512, 256, kernel_size=3, stride=2, padding=1)  
-        self.extra_conv_16 = nn.Conv2d(256, 128, kernel_size=3, stride=1, padding=0)  
+
         
-        self.td_fusion_15_to_14 = TopDownFusionBlock(512, 256, 512)
-        self.td_fusion_14_to_13 = TopDownFusionBlock(1024, 512, 1024)
-        self.td_fusion_13_to_11 = TopDownFusionBlock(512, 1024, 512)
-        self.td_fusion_11_to_8  = TopDownFusionBlock(256, 512, 256)
+        self.extra_14 = nn.Sequential(
+            # Pointwise pentru reducerea canalelor (eficiență)
+            nn.Conv2d(1024, 256, kernel_size=1, stride=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            # Depthwise + Pointwise pentru a ajunge la 512 canale și rezoluție 5x5
+            ConvBlock(256, 512, stride=2) 
+        )
+        # Exemplu de Extra Layer (conv_15_2)
+        self.extra_15 = nn.Sequential(
+            nn.Conv2d(512, 128, kernel_size=1, stride=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            ConvBlock(128, 256, stride=2)
+        )
+        self.extra_16 = nn.Sequential(
+            nn.Conv2d(256, 64, kernel_size=1, stride=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            ConvBlock(64, 128, stride=2, padding = 0)
+        )
+        
+        # În clasa HandTracker, secțiunea de inițializare a blocurilor de fuziune:
+
+        self.fusion_15 = TopDownFusionBlock(channels_low=256,  channels_high_star=128)  # Out: 128
+        self.fusion_14 = TopDownFusionBlock(channels_low=512,  channels_high_star=128)  # Out: 128
+        self.fusion_13 = TopDownFusionBlock(channels_low=1024, channels_high_star=128)  # Out: 128
+        self.fusion_11 = TopDownFusionBlock(channels_low=512,  channels_high_star=128)  # Out: 128
+        self.fusion_8  = TopDownFusionBlock(channels_low=512,  channels_high_star=128)  # Out: 128
         
         self.num_anchors = num_anchors
         
@@ -83,27 +166,32 @@ class HandDetectionNetwork(nn.Module):
                 'loc': nn.Conv2d(in_channels, num_anchors * 4, kernel_size=3, padding=1)  
             })
 
-        self.heads_8 = build_heads(256)
-        self.heads_11 = build_heads(512)
-        self.heads_13 = build_heads(1024)
-        self.heads_14 = build_heads(512)
-        self.heads_15 = build_heads(256)
+        self.heads_8 = build_heads(128)
+        self.heads_11 = build_heads(128)
+        self.heads_13 = build_heads(128)
+        self.heads_14 = build_heads(128)
+        self.heads_15 = build_heads(128)
         self.heads_16 = build_heads(128)
 
     def forward(self, x):
         
         c8, c11, c13 = self.backbone(x)
         
-        c14 = self.extra_conv_14(c13)
-        c15 = self.extra_conv_15(c14)
-        c16 = self.extra_conv_16(c15)
+        c14 = self.extra_14(c13)
+        c15 = self.extra_15(c14)
+        c16 = self.extra_16(c15)
         
-        c14_star = self.td_fusion_15_to_14(c14, c15)
-        c13_star = self.td_fusion_14_to_13(c13, c14_star)
-        c11_star = self.td_fusion_13_to_11(c11, c13_star)
-        c8_star  = self.td_fusion_11_to_8(c8, c11_star)
+        # Fuziune succesivă
+        c16_star = c16 
+    
+        # Rezoluția crește, informația de context coboară
+        c15_star = self.fusion_15(c15, c16_star) # Rezultat: 3x3 actualizat
+        c14_star = self.fusion_14(c14, c15_star) # Rezultat: 5x5 actualizat
+        c13_star = self.fusion_13(c13, c14_star) # Rezultat: 10x10 actualizat
+        c11_star = self.fusion_11(c11, c13_star) # Rezultat: 19x19 actualizat
+        c8_star  = self.fusion_8(c8, c11_star)   # Rezultat: 38x38 actualizat
         
-        features = [c8_star, c11_star, c13_star, c14_star, c15, c16]
+        features = [c8_star, c11_star, c13_star, c14_star, c15_star, c16_star]
         heads_list = [self.heads_8, self.heads_11, self.heads_13, self.heads_14, self.heads_15, self.heads_16]
         
         predictions = {'cls': [], 'loc': []}
