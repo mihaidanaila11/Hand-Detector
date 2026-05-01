@@ -18,31 +18,35 @@ class ConvBlock(nn.Module):
 class MSAB(nn.Module):
     def __init__(self, channels):
         super(MSAB, self).__init__()
+
+        self.c_prime = channels // 4
+
         self.conv1 = nn.Sequential(
-            nn.Conv2d(channels, channels//4, kernel_size=1, stride=1),
-            nn.BatchNorm2d(channels//4),
+            nn.Conv2d(channels, self.c_prime, kernel_size=1, stride=1),
+            nn.BatchNorm2d(self.c_prime),
             nn.ReLU(inplace=True)
         )
         self.conv2 = nn.Sequential(
-            nn.Conv2d(channels, channels//4, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(channels//4),
+            nn.Conv2d(channels, self.c_prime, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(self.c_prime),
             nn.ReLU(inplace=True)
         )
         self.conv3 = nn.Sequential(
-            nn.Conv2d(channels, channels//4, kernel_size=5, stride=1, padding=2),
-            nn.BatchNorm2d(channels//4),
+            nn.Conv2d(channels, self.c_prime, kernel_size=5, stride=1, padding=2),
+            nn.BatchNorm2d(self.c_prime),
             nn.ReLU(inplace=True)
         )
         self.conv4 = nn.Sequential(
-            nn.Conv2d(channels, channels//4, kernel_size=7, stride=1, padding=3),
-            nn.BatchNorm2d(channels//4),
+            nn.Conv2d(channels, self.c_prime, kernel_size=7, stride=1, padding=3),
+            nn.BatchNorm2d(self.c_prime),
             nn.ReLU(inplace=True)
         )
         
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         
         self.fc = nn.Linear(channels, channels//8)
-        
+        self.reluFC = nn.ReLU(inplace=True)
+
         self.fc1 = nn.Linear(channels//8, self.c_prime)
         self.fc2 = nn.Linear(channels//8, self.c_prime)
         self.fc3 = nn.Linear(channels//8, self.c_prime)
@@ -58,6 +62,7 @@ class MSAB(nn.Module):
         f = self.avg_pool(x_a)
         f = f.view(f.size(0), -1)
         f = self.fc(f)
+        f = self.reluFC(f)
         w1  = self.fc1(f)
         w2  = self.fc2(f)
         w3  = self.fc3(f)
@@ -70,7 +75,7 @@ class MSAB(nn.Module):
         
         weights = weights.unsqueeze(-1).unsqueeze(-1)
         out = x_c * weights
-        return out
+        return out.reshape(x.size(0), x.size(1), x.size(2), x.size(3))
 
 class Encoder(nn.Module):
     def __init__(self):
@@ -93,10 +98,100 @@ class Encoder(nn.Module):
             ConvBlock(128, 128)
         )
 
+        self.masb3 = MSAB(128)
+
+        self.maxpool3 = nn.MaxPool2d(2, 2)
+
+        self.layer4 = nn.Sequential(
+            ConvBlock(128, 256),
+            ConvBlock(256, 256)
+        )
+
+        self.masb4 = MSAB(256)
+
 
     def forward(self, x):
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
+        # output 32x256x256
+        c1 = self.layer1(x)
+        p1 = self.maxpool1(c1)
+
+        # output 64x128x128
+        c2 = self.layer2(p1)
+        p2 = self.maxpool2(c2)
+
+        # output 128x64x64
+        c3 = self.layer3(p2)
+        msab3 = self.masb3(c3)
+        p3 = self.maxpool3(msab3)
+
+        # output 256x32x32
+        c4 = self.layer4(p3)
+        msab4 = self.masb4(c4)
+        return msab4, c1, c2, c3
+
+class Decoder(nn.Module):
+    def __init__(self):
+        super(Decoder, self).__init__()
+
+        self.upsample1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.conv1 = nn.Sequential(
+         
+         ConvBlock(384, 128),
+         ConvBlock(128, 128)        
+        )
+
+        self.upsample2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.conv2 = nn.Sequential(
+         ConvBlock(192, 64),
+         ConvBlock(64, 64)        
+        )
+
+        self.upsample3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.conv3 = nn.Sequential(
+         ConvBlock(96, 32),
+         ConvBlock(32, 32)        
+        )
+
+        self.finalCConv = nn.Sequential(
+            nn.Conv2d(32, 21, kernel_size=1, stride=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x, enc_1, enc_2, enc_3):
+        # enc 1 - 32x256x256, 
+        # enc 2 - 64x128x128, 
+        # enc 3 - 128x64x64
+
+        # up1 - 256x64x64
+        # up2 - 128x128x128
+        # up3 - 64x256x256
+
+        # cat1 - 256+128 = 384x64x64
+        # cat2 - 128+64 = 192x128x128
+        # cat3 - 64+32 = 96x256x256
+
+        # output 256x64x64
+        x = self.upsample1(x)
+        x = torch.cat((x, enc_3), dim=1)
+        x = self.conv1(x)
+
+        x = self.upsample2(x)
+        x = torch.cat((x, enc_2), dim=1)
+        x = self.conv2(x)
+
+        x = self.upsample3(x)
+        x = torch.cat((x, enc_1), dim=1)
+        x = self.conv3(x)
+        x = self.finalCConv(x)
+        return x
+
+class HandKeypointDetector(nn.Module):
+    def __init__(self):
+        super(HandKeypointDetector, self).__init__()
+        self.encoder = Encoder()
+        self.decoder = Decoder()
+
+    def forward(self, x):
+        x, enc_1, enc_2, enc_3 = self.encoder(x)
+        x = self.decoder(x, enc_1, enc_2, enc_3)
         return x
