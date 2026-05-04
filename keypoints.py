@@ -44,7 +44,7 @@ class MSAB(nn.Module):
         
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         
-        self.fc = nn.Linear(channels, channels//8)
+        self.fc = nn.Linear(self.c_prime, channels//8)
         self.reluFC = nn.ReLU(inplace=True)
 
         self.fc1 = nn.Linear(channels//8, self.c_prime)
@@ -195,3 +195,92 @@ class HandKeypointDetector(nn.Module):
         x, enc_1, enc_2, enc_3 = self.encoder(x)
         x = self.decoder(x, enc_1, enc_2, enc_3)
         return x
+
+import torch
+import torch.nn as nn
+
+class IoULossHeatmap(nn.Module):
+    def __init__(self, num_keypoints=21, sigma=3):
+        super(IoULossHeatmap, self).__init__()
+        self.K = num_keypoints
+        self.sigma = sigma
+
+    def generate_gaussian_heatmap(self, size, keypoint, device):
+        """
+        Generează un heatmap Gaussian 2D pentru un singur punct.
+        """
+        h, w = size
+        u, v = keypoint
+        
+        # Creăm grila de coordonate direct pe device-ul corect (GPU/CPU)
+        grid_y, grid_x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing='ij')
+        grid_y = grid_y.to(device)
+        grid_x = grid_x.to(device)
+        
+        # Formula Gaussiană 2D[cite: 3]
+        gaussian = torch.exp(-((grid_x - u)**2 + (grid_y - v)**2) / (2 * self.sigma**2))
+        
+        # Normalizăm astfel încât vârful să fie exact 1.0
+        return gaussian / (gaussian.max() + 1e-7)  
+
+    def forward(self, h_pred, labels):
+        """
+        h_pred: Tensor de forma (Batch, K, H, W) - Ieșirea modelului tău
+        labels: Lista de tensori 1D (fără bbox), care vin din DataLoader
+        """
+        h_pred = h_pred.float()
+        batch_size = h_pred.size(0)
+        # h, w = h_pred.size(2), h_pred.size(3)
+        h,w = 128, 128
+        device = h_pred.device
+
+        if h_pred.size(2) != h or h_pred.size(3) != w:
+            h_pred = torch.nn.functional.interpolate(
+                h_pred, 
+                size=(h, w), 
+                mode='bilinear', 
+                align_corners=False
+            )
+        
+        # Inițializăm tensorul ground-truth cu zerouri, de aceeași formă cu predicția
+        h_true = torch.zeros((batch_size, self.K, h, w), device=device, dtype=h_pred.dtype)
+
+        grid_y = torch.arange(h, device=device, dtype=h_pred.dtype).view(1, h, 1)
+        grid_x = torch.arange(w, device=device, dtype=h_pred.dtype).view(1, 1, w)
+        
+        for b in range(batch_size):
+            label = labels[b]
+            
+            # Fără bbox, label-ul conține DOAR cele 21 de puncte.
+            # -1 permite PyTorch să deducă automat dacă e (21, 3) sau (21, 2)
+            kps = label.view(self.K, -1) 
+
+            keypoints = kps[:, :2]
+            x_px = keypoints[:, 0].unsqueeze(1).unsqueeze(2) * w
+            y_px = keypoints[:, 1].unsqueeze(1).unsqueeze(2) * h
+
+            gaussian = torch.exp(-((grid_x - x_px) ** 2 + (grid_y - y_px) ** 2) / (2 * self.sigma**2))
+            h_true[b] = gaussian / (gaussian.amax(dim=(1, 2), keepdim=True) + 1e-7)
+            
+        # ---------------- Calculul Modified IoU[cite: 3] ---------------- #
+        
+        # Intersecția: Produsul element cu element
+        intersection = torch.sum(h_pred * h_true, dim=(2, 3))
+        
+        # Pătratele pentru a calcula reuniunea
+        pred_sq = torch.sum(h_pred ** 2, dim=(2, 3))
+        true_sq = torch.sum(h_true ** 2, dim=(2, 3))
+        
+        # Reuniunea
+        union = pred_sq + true_sq - intersection
+        
+        # Calculul IoU per fiecare keypoint, cu un epsilon pentru a evita divizarea la zero
+        iou_per_keypoint = (intersection + 1e-7) / (union + 1e-7)
+        
+        # Sumăm IoU-urile celor 21 de puncte pentru fiecare imagine din batch
+        sum_iou = torch.sum(iou_per_keypoint, dim=1) 
+        
+        # Loss-ul final este 1 minus media aritmetică a IoU-urilor[cite: 3]
+        loss_final = 1 - (torch.mean(sum_iou) / self.K)
+        
+        return loss_final
