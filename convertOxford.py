@@ -4,7 +4,7 @@ import numpy as np
 from pathlib import Path
 
 # Încarcă fișierul de adnotări
-TRAIN_LABELS = Path('dataset/oxford_hands/test_dataset/test_data/annotations')
+TRAIN_LABELS = Path('dataset/oxford_hands/training_dataset/training_data/annotations')
 CONVERTED_LABELS = TRAIN_LABELS / "converted"
 
 

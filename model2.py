@@ -219,56 +219,67 @@ def encode_boxes(matched_truths, priors):
     g_wh = torch.log(torch.clamp(g_wh, min=eps)) / variance[1]
     
     return torch.cat([g_cxcy, g_wh], 1)  
+
 class HandTrackerLoss(nn.Module):
-    def __init__(self, anchors_cxcy, threshold=0.5, weight_box=5.0):
+    def __init__(self, anchors_cxcy, threshold=0.5, weight_box=1.0): # Scădem weight_box la 1.0 conform lucrării
         super(HandTrackerLoss, self).__init__()
         self.threshold = threshold
         self.weight_box = weight_box
-        
         self.priors_cxcy = anchors_cxcy
         self.priors_xy = cxcy_to_xy(anchors_cxcy)
 
     def forward(self, out, labels):
+        # 1. Pregătirea predicțiilor
         preds_cls = torch.cat([o.permute(0, 2, 3, 1).contiguous().view(o.size(0), -1) 
                                for o in out["cls"]], dim=1) 
-                               
         preds_loc = torch.cat([o.permute(0, 2, 3, 1).contiguous().view(o.size(0), -1, 4) 
                                for o in out["loc"]], dim=1) 
 
         batch_size = preds_cls.size(0)
         num_priors = self.priors_cxcy.size(0)
+        device = preds_cls.device
         
-        
-        target_conf = torch.zeros(batch_size, num_priors, device=preds_cls.device)
-        target_loc = torch.zeros(batch_size, num_priors, 4, device=preds_loc.device)
+        target_conf = torch.zeros(batch_size, num_priors, device=device)
+        target_loc = torch.zeros(batch_size, num_priors, 4, device=device)
 
+        # 2. Matching (SSD logic)
         for idx in range(batch_size):
             truths = labels[idx][:, 1:] 
-            
-            if truths.size(0) == 0:
-                continue
+            if truths.size(0) == 0: continue
                 
             overlaps = box_iou(truths, self.priors_xy.to(truths.device))
-            
             best_truth_overlap, best_truth_idx = overlaps.max(0)
             
             matched_truths = truths[best_truth_idx]
-            
-            target_loc[idx] = encode_boxes(matched_truths, self.priors_cxcy.to(truths.device))
-            
+            target_loc[idx] = encode_boxes(matched_truths, self.priors_cxcy.to(device))
             target_conf[idx][best_truth_overlap > self.threshold] = 1.0
 
-        greutate_pozitiva = torch.tensor([75.0], device=preds_cls.device)
+        # 3. HARD NEGATIVE MINING
+        # Calculăm loss-ul brut pentru clasificare
+        loss_c = F.binary_cross_entropy_with_logits(preds_cls, target_conf, reduction='none')
         
-        loss_conf = F.binary_cross_entropy_with_logits(preds_cls, target_conf, pos_weight=greutate_pozitiva)
-        
-        loss_box_raw = F.smooth_l1_loss(preds_loc, target_loc, reduction='none').sum(dim=-1)
-        
-        
-        pos_mask = target_conf > 0
-        loss_box_masked = (loss_box_raw * pos_mask).sum() / (pos_mask.sum() + 1e-5)
+        pos_mask = target_conf > 0  # Unde avem mâini
+        num_pos = pos_mask.long().sum(1, keepdim=True)
 
-        return loss_conf + (self.weight_box * loss_box_masked)
-    
-    
-    
+        # Sortăm doar negativele (fundalul) după eroare
+        loss_c_for_mining = loss_c.clone()
+        loss_c_for_mining[pos_mask] = 0 # Ignorăm pozitivele la sortare
+        
+        _, loss_idx = loss_c_for_mining.sort(1, descending=True)
+        _, idx_rank = loss_idx.sort(1)
+        
+        # Selectăm de 3 ori mai multe negative decât pozitive 
+        num_neg = torch.clamp(3 * num_pos, max=num_priors - 1)
+        hard_neg_mask = idx_rank < num_neg
+        
+        # 4. CALCULUL LOSS-URILOR FINALE
+        # Confidență: Calculată pe Pozitive + Hard Negatives
+        conf_mask = pos_mask | hard_neg_mask
+        loss_conf = loss_c[conf_mask].sum() / (num_pos.sum() + 1e-5)
+        
+        # Localizare: Calculată DOAR pe Pozitive
+        loss_box_raw = F.smooth_l1_loss(preds_loc, target_loc, reduction='none').sum(dim=-1)
+        loss_box = (loss_box_raw * pos_mask).sum() / (num_pos.sum() + 1e-5)
+
+        # Total loss conform structurii simplificate a lucrării 
+        return loss_conf + (self.weight_box * loss_box)

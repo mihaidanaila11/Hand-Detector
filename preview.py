@@ -1,6 +1,11 @@
+import os
+
+os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/TTF")
+
 import cv2
 import torch
 from torchvision import transforms
+from torchvision.ops import box_iou
 from PIL import Image
 from model2 import HandDetectionNetwork
 from itertools import product
@@ -58,8 +63,35 @@ def decode_boxes(loc_preds, priors):
     return boxes_cxcy
 
 
+def draw_high_iou_anchors(frame, anchors_xy, reference_box_xy, threshold=0.5, max_draw=80):
+    if reference_box_xy is None:
+        return frame, 0
+
+    ious = box_iou(anchors_xy, reference_box_xy.unsqueeze(0)).squeeze(1)
+    keep_indices = torch.where(ious > threshold)[0]
+
+    drawn = 0
+    for idx in keep_indices[:max_draw]:
+        anchor = anchors_xy[idx]
+
+        xmin = int(anchor[0].item() * frame.shape[1])
+        ymin = int(anchor[1].item() * frame.shape[0])
+        xmax = int(anchor[2].item() * frame.shape[1])
+        ymax = int(anchor[3].item() * frame.shape[0])
+
+        xmin = max(0, xmin)
+        ymin = max(0, ymin)
+        xmax = min(frame.shape[1], xmax)
+        ymax = min(frame.shape[0], ymax)
+
+        cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (255, 0, 0), 1)
+        drawn += 1
+
+    return frame, drawn
+
+
 model = HandDetectionNetwork(num_anchors=6).to(device)
-model.load_state_dict(torch.load("best_model.pth", map_location=device, weights_only=True))
+model.load_state_dict(torch.load("checkpoints/best_model_fine_epoch17.pth", map_location=device, weights_only=True))
 model.eval() 
 
 
@@ -98,8 +130,10 @@ while rval:
         probs = torch.sigmoid(preds_cls.squeeze(0)) 
 
         best_prob, best_idx = probs.max(dim=0)
+
+        print(f"Probabilitate maximă: {best_prob.item()*100:.1f}%")
         
-        if best_prob.item() > 0.5:
+        if best_prob.item() > 0.2:
             
             best_loc = preds_loc[0, best_idx, :].unsqueeze(0)
             best_prior = default_boxes[best_idx, :].unsqueeze(0)
@@ -115,9 +149,20 @@ while rval:
             xmin, ymin = max(0, xmin), max(0, ymin)
             xmax, ymax = min(W, xmax), min(H, ymax)
 
+            print(f"Mana detectată cu {best_prob.item()*100:.1f}% încredere la coordonatele: ({xmin}, {ymin}), ({xmax}, {ymax})")
+
             cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
             cv2.putText(frame, f"Mana: {best_prob.item()*100:.1f}%", (xmin, ymin - 10), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+            frame, anchors_drawn = draw_high_iou_anchors(
+                frame,
+                default_boxes.detach().cpu(),
+                decoded_box_xy.detach().cpu(),
+                threshold=0.5,
+            )
+
+            print(f"Ancore desenate cu IoU > 0.5: {anchors_drawn}")
 
     cv2.imshow("preview", frame)
     
