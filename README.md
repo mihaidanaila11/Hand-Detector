@@ -24,10 +24,13 @@ Modelul este compus din două secțiuni principale:
 Modelul a fost evaluat folosind trei metrici fundamentale:
 *   **Mean End-to-End Point Error (EPE)**: Distanța euclidiană medie între predicție și ground-truth.
     *   *Rezultat*: Medie de **0.1625** pe 100 de imagini.
+    ![epe 100 images](diagrams/epe_values_100_images.png)
 *   **Percentage of Correct Keypoints (PCK)**: Procentul de puncte corecte sub un prag de toleranță de 0.1.
     *   *Rezultat*: Medie de **0.5643**.
+    ![PCK 100 images](diagrams/pke_values_100_images.png)
 *   **Inference Time**: Eficiența procesării per cadru.
     *   *Rezultat*: Timp stabil de aproximativ **12.39 ms** după faza de optimizare.
+    ![PCK 100 images](diagrams/time_values_100_images.png)
 
 ## 🛠️ Detalii Implementare Antrenament
 Antrenamentul a fost structurat pentru a asigura o tranziție lină de la învățarea globală la rafinarea detaliilor:
