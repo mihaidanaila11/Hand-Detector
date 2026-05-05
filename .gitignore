@@ -1,2 +1,4 @@
 dataset
 *.pdf
+venv*
+__pycache__
